@@ -1,14 +1,8 @@
 import "dotenv/config";
-import express from "express";
 import { chromium } from "playwright";
-import fs from "node:fs/promises";
 
-const app = express();
-
-const PORT = process.env.PORT || 3000;
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const MAX_PRICE = Number(process.env.MAX_PRICE_EUR || 25);
-const INTERVAL = Number(process.env.POLL_INTERVAL_MS || 60000);
 
 const SEARCHES = [
   "nike trail",
@@ -23,25 +17,24 @@ const SEARCHES = [
   "nike running technique"
 ];
 
-const seen = new Set();
-
 async function sendDiscord(item) {
   if (!WEBHOOK) {
-    console.log("Webhook Discord non configuré");
-    return;
+    throw new Error("DISCORD_WEBHOOK_URL manquant");
   }
 
-  await fetch(WEBHOOK, {
+  const response = await fetch(WEBHOOK, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json"
+    },
     body: JSON.stringify({
       username: "Nike Vinted Alert",
       embeds: [{
         title: `🆕 ${item.title}`,
         url: item.url,
         description:
-          `💰 **${item.price} €**\n` +
-          `🔎 ${item.search}\n\n` +
+          `💰 **${item.price.toFixed(2)} €**\n` +
+          `🔎 Recherche : ${item.search}\n\n` +
           `👉 **Ouvrir l'annonce Vinted**`,
         image: item.image ? { url: item.image } : undefined,
         footer: {
@@ -50,16 +43,21 @@ async function sendDiscord(item) {
       }]
     })
   });
+
+  if (!response.ok) {
+    throw new Error(`Discord HTTP ${response.status}`);
+  }
 }
 
 async function scan() {
-  let browser;
+  const browser = await chromium.launch({ headless: true });
 
   try {
-    browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
 
     for (const search of SEARCHES) {
+      console.log(`🔎 Scan : ${search}`);
+
       const url =
         "https://www.vinted.fr/catalog?search_text=" +
         encodeURIComponent(search);
@@ -69,55 +67,75 @@ async function scan() {
         timeout: 30000
       });
 
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(2000);
 
       const items = await page.evaluate(() => {
-        return [...document.querySelectorAll('a[href*="/items/"]')]
-          .map(a => {
-            const card = a.closest("div");
-            const text = card?.innerText || a.innerText || "";
-            const priceMatch = text.match(/(\\d+(?:[,.]\\d{1,2})?)\\s*€/);
+        const links = [...document.querySelectorAll('a[href*="/items/"]')];
+        const results = [];
+        const ids = new Set();
 
-            return {
-              url: a.href,
-              title: a.innerText?.trim() || "Nike",
-              price: priceMatch
-                ? Number(priceMatch[1].replace(",", "."))
-                : null,
-              image: card?.querySelector("img")?.src || ""
-            };
-          })
-          .filter(x => x.url);
+        for (const link of links) {
+          const url = link.href;
+          const match = url.match(/\/items\/(\d+)/);
+
+          if (!match || ids.has(match[1])) continue;
+
+          ids.add(match[1]);
+
+          const card = link.closest("div");
+          const text = card?.innerText || link.innerText || "";
+
+          const priceMatch = text.match(
+            /(\d+(?:[,.]\d{1,2})?)\s*€/
+          );
+
+          if (!priceMatch) continue;
+
+          const price = Number(
+            priceMatch[1].replace(",", ".")
+          );
+
+          const image = card?.querySelector("img");
+
+          results.push({
+            id: match[1],
+            title:
+              image?.alt ||
+              link.innerText?.trim() ||
+              "Nike",
+            price,
+            url,
+            image: image?.src || ""
+          });
+        }
+
+        return results;
       });
 
       for (const item of items) {
-        if (!item.price || item.price > MAX_PRICE) continue;
-
-        const id = item.url;
-
-        if (seen.has(id)) continue;
-
-        seen.add(id);
+        if (item.price > MAX_PRICE) continue;
 
         await sendDiscord({
           ...item,
           search
         });
+
+        console.log(
+          `📨 Envoyé : ${item.title} — ${item.price} €`
+        );
       }
     }
-  } catch (error) {
-    console.error("Erreur:", error.message);
   } finally {
-    if (browser) await browser.close();
+    await browser.close();
   }
 }
 
-app.get("/", (_req, res) => {
-  res.send("🟢 Nike Vinted Alert fonctionne");
-});
-
-app.listen(PORT, () => {
-  console.log(`Bot lancé sur le port ${PORT}`);
-  scan();
-  setInterval(scan, INTERVAL);
-});
+scan()
+  .then(() => {
+    console.log("✅ Scan terminé");
+    process.exit(0);
+  })
+  .catch(error => {
+    console.error("❌ Erreur :", error);
+    process.exit(1);
+  });
